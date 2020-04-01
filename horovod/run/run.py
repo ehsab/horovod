@@ -17,13 +17,12 @@ from __future__ import print_function
 
 import argparse
 import hashlib
+import logging
 import os
 import sys
 import re
 import textwrap
 
-from socket import AF_INET
-from psutil import net_if_addrs
 try:
     from shlex import quote
 except ImportError:
@@ -31,19 +30,19 @@ except ImportError:
 
 import six
 import yaml
-import cloudpickle
 
 import horovod
 
 from horovod.common.util import (extension_available,
                                  gloo_built, mpi_built,
                                  nccl_built, ddl_built, ccl_built)
-from horovod.run.common.util import codec, config_parser, safe_shell_exec, timeout, secret
+from horovod.run.common.util import codec, config_parser, network, safe_shell_exec, timeout, secret
 from horovod.run.common.util import settings as hvd_settings
 from horovod.run.driver import driver_service
+from horovod.run.elastic import settings as elastic_settings
 from horovod.run.task import task_service
 from horovod.run.util import cache, threads, network
-from horovod.run.gloo_run import gloo_run
+from horovod.run.gloo_run import gloo_run, gloo_run_elastic
 from horovod.run.mpi_run import mpi_run
 from horovod.run.http.http_client import read_data_from_kvstore, put_data_into_kvstore
 from horovod.run.http.http_server import KVStoreServer
@@ -163,28 +162,33 @@ def _launch_task_servers(all_host_names, local_host_names, driver_addresses,
     else:
         ssh_port_arg = ''
     args_list = []
-    for index in range(len(all_host_names)):
+
+    num_hosts = len(all_host_names)
+    for index in range(num_hosts):
         host_name = all_host_names[index]
         if host_name in local_host_names:
             command = \
-                '{python} -m horovod.run.task_fn {index} ' \
+                '{python} -m horovod.run.task_fn {index} {num_hosts} ' \
                 '{driver_addresses} {settings}'\
                 .format(python=sys.executable,
                         index=codec.dumps_base64(index),
+                        num_hosts=codec.dumps_base64(num_hosts),
                         driver_addresses=codec.dumps_base64(driver_addresses),
                         settings=codec.dumps_base64(settings))
         else:
             command = \
                 'ssh -o StrictHostKeyChecking=no {host} {ssh_port_arg} ' \
-                '\'{python} -m horovod.run.task_fn {index} {driver_addresses}' \
+                '\'{python} -m horovod.run.task_fn {index} {num_hosts} {driver_addresses}' \
                 ' {settings}\''\
                 .format(host=host_name,
                         ssh_port_arg=ssh_port_arg,
                         python=sys.executable,
                         index=codec.dumps_base64(index),
+                        num_hosts=codec.dumps_base64(num_hosts),
                         driver_addresses=codec.dumps_base64(driver_addresses),
                         settings=codec.dumps_base64(settings))
         args_list.append([command])
+
     # Each thread will use ssh command to launch the server on one task. If an
     # error occurs in one thread, entire process will be terminated. Otherwise,
     # threads will keep running and ssh session -- and the the task server --
@@ -216,8 +220,9 @@ def _driver_fn(all_host_names, local_host_names, settings):
     """
     # Launch a TCP server called service service on the host running
     # horovodrun.
+    num_hosts = len(all_host_names)
     driver = driver_service.HorovodRunDriverService(
-        settings.num_hosts, settings.key, settings.nic)
+        num_hosts, settings.key, settings.nic)
     if settings.verbose >= 2:
         print('Launched horovodrun server.')
     # Have all the workers register themselves with the service service.
@@ -236,7 +241,7 @@ def _driver_fn(all_host_names, local_host_names, settings):
                 driver.task_addresses_for_driver(index),
                 settings.key,
                 settings.verbose) for index in range(
-                settings.num_hosts)]
+                num_hosts)]
         # Notify all the drivers that the initial registration is complete.
         for task in tasks:
             task.notify_initial_registration_complete()
@@ -254,7 +259,7 @@ def _driver_fn(all_host_names, local_host_names, settings):
             print('Host-to-host interface checking successful.')
         # Determine a set of common interfaces for task-to-task communication.
         common_intfs = set(driver.task_addresses_for_tasks(0).keys())
-        for index in range(1, settings.num_hosts):
+        for index in range(1, num_hosts):
             common_intfs.intersection_update(
                 driver.task_addresses_for_tasks(index).keys())
         if not common_intfs:
@@ -262,28 +267,10 @@ def _driver_fn(all_host_names, local_host_names, settings):
                 'Unable to find a set of common task-to-task communication '
                 'interfaces: %s'
                 % [(index, driver.task_addresses_for_tasks(index))
-                   for index in range(settings.num_hosts)])
+                   for index in range(num_hosts)])
         return common_intfs
     finally:
         driver.shutdown()
-
-
-def _get_driver_ip(common_intfs):
-    """
-    :param common_intfs: object return by `_driver_fn`
-    :return: driver ip. We make sure all workers can connect to this ip.
-    """
-    iface = list(common_intfs)[0]
-    driver_ip = None
-    for addr in net_if_addrs()[iface]:
-        if addr.family == AF_INET:
-            driver_ip = addr.address
-
-    if not driver_ip:
-        raise RuntimeError(
-            'Cannot find an IPv4 address of the common interface.')
-
-    return driver_ip
 
 
 def check_build(verbose):
@@ -402,7 +389,8 @@ def parse_args():
 
     np_arg = parser.add_argument('-np', '--num-proc', action='store', dest='np',
                                  type=int, required=True,
-                                 help='Total number of training processes.')
+                                 help='Total number of training processes. In elastic mode, '
+                                      'number of processes required before training can start.')
 
     parser.add_argument('-cb', '--check-build', action=make_check_build_action(np_arg), nargs=0,
                         help='Shows which frameworks and libraries have been built into Horovod.')
@@ -519,6 +507,19 @@ def parse_args():
                                 help='Regularization value [0, 1] applied to account for noise in samples. '
                                      '(default: %(default)s)')
 
+    group_elastic = parser.add_argument_group('elastic arguments')
+    group_elastic.add_argument('--min-np', action='store', dest='min_np', type=int,
+                               help='Minimum number of processes running for training to continue. If number of '
+                                    'available processes dips below this threshold, then training will wait for '
+                                    'more instances to become available. Defaults to --num-proc.')
+    group_elastic.add_argument('--max-np', action='store', dest='max_np', type=int,
+                               help='Maximum number of training processes, beyond which no additional '
+                                    'processes will be created. If not specified, then will be unbounded.')
+    group_elastic.add_argument('--slots-per-host', action='store', dest='slots', type=int,
+                               help='Number of slots for processes per host. Normally 1 slot per GPU per host. '
+                                    'If slots are provided by the output of the host discovery script, then '
+                                    'that value will override this parameter.')
+
     group_timeline = parser.add_argument_group('timeline arguments')
     group_timeline.add_argument('--timeline-filename', action=make_override_action(override_args),
                                 help='JSON file containing timeline of Horovod events used for debugging '
@@ -588,7 +589,7 @@ def parse_args():
                                          action=make_override_false_action(override_args), help=argparse.SUPPRESS)
 
     group_hosts_parent = parser.add_argument_group('host arguments')
-    group_hosts = group_hosts_parent.add_mutually_exclusive_group()
+    group_hosts = group_hosts_parent.add_mutually_exclusive_group(required=True)
     group_hosts.add_argument('-H', '--hosts', action='store', dest='hosts',
                              help='List of host names and the number of available slots '
                                   'for running processes on each, of the form: <hostname>:<slots> '
@@ -599,6 +600,12 @@ def parse_args():
                              help='Path to a host file containing the list of host names and the number of '
                                   'available slots. Each line of the file must be of the form: '
                                   '<hostname> slots=<slots>')
+    group_hosts.add_argument('--host-discovery-script', action=make_override_action(override_args),
+                             help='Used for elastic training (autoscaling and fault tolerance). '
+                                  'An executable script that will print to stdout every available host (one per '
+                                  'newline character) that can be used to run worker processes. Optionally '
+                                  'specifies number of slots on the same line as the hostname as: "hostname:slots".'
+                                  'Providing a discovery script enables elastic training (see elastic arguments)')
 
     group_controller_parent = parser.add_argument_group('controller arguments')
     group_controller = group_controller_parent.add_mutually_exclusive_group()
@@ -617,30 +624,31 @@ def parse_args():
         config_parser.set_args_from_config(args, config, override_args)
     config_parser.validate_config_args(args)
 
+    args.run_func = None
+
     return args
 
 
 class HorovodArgs(object):
-
     def __init__(self):
         self.np = 1
         self.check_build = None
         self.ssh_port = None
         self.disable_cache = None
         self.start_timeout = None
+        self.nic = None
         self.output_filename = None
         self.verbose = None
         self.command = None
         self.run_func = None
         self.config_file = None
-        self.nic = None
 
         # tuneable parameter arguments
         self.fusion_threshold_mb = None
         self.cycle_time_ms = None,
         self.cache_capacity = None,
 
-        # hierrachy
+        # hierarchy
         self.hierarchical_allreduce = None
         self.hierarchical_allgather = None
 
@@ -651,6 +659,11 @@ class HorovodArgs(object):
         self.autotune_steps_per_sample = None
         self.autotune_bayes_opt_max_samples = None
         self.autotune_gaussian_process_noise = None
+
+        # elastic arguments
+        self.min_np = None
+        self.max_np = None
+        self.slots = None
 
         # timeline arguments
         self.timeline_filename = None
@@ -677,6 +690,7 @@ class HorovodArgs(object):
         # host arguments
         self.hosts = None
         self.hostfile = None
+        self.host_discovery_script = None
 
         # controller arguments
         self.use_gloo = None
@@ -698,6 +712,53 @@ def parse_host_files(filename):
             slots = line.split('=')[1]
             hosts.append('{name}:{slots}'.format(name=hostname, slots=slots))
     return ','.join(hosts)
+
+
+def get_common_intfs(all_host_names, settings, fn_cache=None):
+    if settings.verbose >= 2:
+        print('Filtering local host names.')
+    remote_host_names = network.filter_local_addresses(all_host_names)
+    if settings.verbose >= 2:
+        print('Remote host found: ' + ' '.join(remote_host_names))
+
+    if len(remote_host_names) > 0:
+        if settings.verbose >= 2:
+            print('Checking ssh on all remote hosts.')
+        # Check if we can ssh into all remote hosts successfully.
+        _check_all_hosts_ssh_successful(remote_host_names, settings.ssh_port,
+                                        fn_cache=fn_cache)
+        if settings.verbose >= 2:
+            print('SSH was successful into all the remote hosts.')
+
+    local_host_names = set(all_host_names) - set(remote_host_names)
+    if len(remote_host_names) > 0:
+        if settings.verbose >= 2:
+            print('Testing interfaces on all the hosts.')
+
+        # Find the set of common, routed interfaces on all the hosts (remote
+        # and local) and specify it in the args to be used by NCCL. It is
+        # expected that the following function will find at least one interface
+        # otherwise, it will raise an exception.
+        common_intfs = _driver_fn(all_host_names, local_host_names,
+                                  settings, fn_cache=fn_cache)
+
+        if settings.verbose >= 2:
+            print('Interfaces on all the hosts were successfully checked.')
+            print('Common interface found: ' + ' '.join(common_intfs))
+
+    else:
+        if settings.verbose >= 2:
+            print('All hosts are local, finding the interfaces '
+                  'with address 127.0.0.1')
+        # If all the given hosts are local, find the interfaces with address
+        # 127.0.0.1
+        common_intfs = network.get_local_intfs(settings.nic)
+        if len(common_intfs) == 0:
+            raise ValueError('No interface is found for address 127.0.0.1.')
+
+        if settings.verbose >= 2:
+            print('Local interface found ' + ' '.join(common_intfs))
+    return common_intfs, local_host_names
 
 
 def _run(args):
@@ -741,9 +802,9 @@ def _run(args):
                                      binding_args=args.binding_args,
                                      key=secret.make_secret_key(),
                                      timeout=tmout,
-                                     num_hosts=len(all_host_names),
                                      num_proc=args.np,
                                      hosts=args.hosts,
+                                     num_hosts=len(all_host_names),
                                      output_filename=args.output_filename,
                                      run_func_mode=args.run_func is not None,
                                      nic=args.nic)
@@ -764,97 +825,80 @@ def _run(args):
         fn_cache = cache.Cache(CACHE_FOLDER, CACHE_STALENESS_THRESHOLD_MINUTES,
                                parameters_hash)
 
-    if settings.verbose >= 2:
-        print('Filtering local host names.')
-    remote_host_names = network.filter_local_addresses(all_host_names)
-    if settings.verbose >= 2:
-        print('Remote host found: ' + ' '.join(remote_host_names))
-
-    if len(remote_host_names) > 0:
-        if settings.verbose >= 2:
-            print('Checking ssh on all remote hosts.')
-        # Check if we can ssh into all remote hosts successfully.
-        _check_all_hosts_ssh_successful(remote_host_names, args.ssh_port,
-                                        fn_cache=fn_cache)
-        if settings.verbose >= 2:
-            print('SSH was successful into all the remote hosts.')
-
-    if len(remote_host_names) > 0:
-        if settings.verbose >= 2:
-            print('Testing interfaces on all the hosts.')
-
-        local_host_names = set(all_host_names) - set(remote_host_names)
-        # Find the set of common, routed interfaces on all the hosts (remote
-        # and local) and specify it in the args to be used by NCCL. It is
-        # expected that the following function will find at least one interface
-        # otherwise, it will raise an exception.
-        common_intfs = _driver_fn(all_host_names, local_host_names,
-                                  settings, fn_cache=fn_cache)
-
-        if settings.verbose >= 2:
-            print('Interfaces on all the hosts were successfully checked.')
-            print('Common interface found: ' + ' '.join(common_intfs))
-
-    else:
-        if settings.verbose >= 2:
-            print('All hosts are local, finding the interfaces '
-                  'with address 127.0.0.1')
-        # If all the given hosts are local, find the interfaces with address
-        # 127.0.0.1
-        common_intfs = set()
-        for iface, addrs in net_if_addrs().items():
-            if settings.nic and iface != settings.nic:
-                continue
-            for addr in addrs:
-                if addr.family == AF_INET and addr.address == '127.0.0.1':
-                    common_intfs.add(iface)
-                    break
-
-        if len(common_intfs) == 0:
-            raise ValueError('No interface is found for address 127.0.0.1.')
-
-        if settings.verbose >= 2:
-            print('Local interface found ' + ' '.join(common_intfs))
+    common_intfs, local_host_names = get_common_intfs(all_host_names, settings, fn_cache)
 
     # get the driver IPv4 address
-    driver_ip = _get_driver_ip(common_intfs)
+    driver_ip = network.get_driver_ip(common_intfs)
 
     if args.run_func:
         run_func_server = KVStoreServer(verbose=settings.verbose)
         run_func_server_port = run_func_server.start_server()
-        pickled_exec_func = cloudpickle.dumps(args.run_func)
         put_data_into_kvstore(driver_ip, run_func_server_port,
-                              'runfunc', 'func', pickled_exec_func)
+                              'runfunc', 'func', args.run_func)
 
         command = [sys.executable, '-m', 'horovod.run.run_task', str(driver_ip), str(run_func_server_port)]
 
         try:
-            _launch_job(args, remote_host_names, settings, common_intfs, command)
+            _launch_job(args, settings, common_intfs, command)
             results = [None] * args.np
             # TODO: make it parallel to improve performance
             for i in range(args.np):
-                pickled_result = read_data_from_kvstore(driver_ip, run_func_server_port,
-                                                        'runfunc_result', str(i))
-                results[i] = cloudpickle.loads(pickled_result)
+                results[i] = read_data_from_kvstore(driver_ip, run_func_server_port,
+                                                    'runfunc_result', str(i))
             return results
         finally:
             run_func_server.shutdown_server()
     else:
         command = args.command
-        _launch_job(args, remote_host_names, settings, common_intfs, command)
+        _launch_job(args, settings, common_intfs, command)
         return None
 
 
-def _launch_job(args, remote_host_names, settings, common_intfs, command):
+def _run_elastic(args):
+    # horovodrun has to finish all the checks before this timeout runs out.
+    if args.start_timeout:
+        start_timeout = args.start_timeout
+    else:
+        # Lookup default timeout from the environment variable.
+        start_timeout = int(os.getenv('HOROVOD_START_TIMEOUT', '30'))
+
+    tmout = timeout.Timeout(start_timeout,
+                            message='Timed out waiting for {activity}. Please '
+                                    'check connectivity between servers. You '
+                                    'may need to increase the --start-timeout '
+                                    'parameter if you have too many servers.')
+    settings = elastic_settings.ElasticSettings(discovery_script=args.host_discovery_script,
+                                                num_proc=args.np,
+                                                min_np=args.min_np or args.np,
+                                                max_np=args.max_np,
+                                                slots=args.slots,
+                                                verbose=2 if args.verbose else 0,
+                                                ssh_port=args.ssh_port,
+                                                extra_mpi_args=args.mpi_args,
+                                                key=secret.make_secret_key(),
+                                                timeout=tmout,
+                                                output_filename=args.output_filename,
+                                                run_func_mode=args.run_func is not None,
+                                                nic=args.nic)
+
+    if not gloo_built(verbose=(settings.verbose >= 2)):
+        raise ValueError('Gloo support is required to use elastic traiing, but has not been built.  Ensure CMake is '
+                         'installed and reinstall Horovod with HOROVOD_WITH_GLOO=1 to debug the build error.')
+
     env = os.environ.copy()
     config_parser.set_env_from_args(env, args)
-    driver_ip = _get_driver_ip(common_intfs)
+    gloo_run_elastic(settings, env, args.command, get_common_intfs)
+
+
+def _launch_job(args, settings, common_intfs, command):
+    env = os.environ.copy()
+    config_parser.set_env_from_args(env, args)
 
     if args.use_gloo:
         if not gloo_built(verbose=(settings.verbose >= 2)):
             raise ValueError('Gloo support has not been built.  If this is not expected, ensure CMake is installed '
                              'and reinstall Horovod with HOROVOD_WITH_GLOO=1 to debug the build error.')
-        gloo_run(settings, remote_host_names, common_intfs, env, driver_ip, command)
+        gloo_run(settings, common_intfs, env, command)
     elif args.use_mpi:
         if not mpi_built(verbose=(settings.verbose >= 2)):
             raise ValueError('MPI support has not been built.  If this is not expected, ensure MPI is installed '
@@ -864,16 +908,27 @@ def _launch_job(args, remote_host_names, settings, common_intfs, command):
         if mpi_built(verbose=(settings.verbose >= 2)):
             mpi_run(settings, common_intfs, env, command)
         elif gloo_built(verbose=(settings.verbose >= 2)):
-            gloo_run(settings, remote_host_names, common_intfs, env, driver_ip, command)
+            gloo_run(settings, common_intfs, env, command)
         else:
             raise ValueError('Neither MPI nor Gloo support has been built. Try reinstalling Horovod ensuring that '
                              'either MPI is installed (MPI) or CMake is installed (Gloo).')
 
 
+def is_elastic(args):
+    return args.host_discovery_script is not None
+
+
 def run_commandline():
     args = parse_args()
-    args.run_func = None
-    _run(args)
+
+    if args.log_level:
+        logging.addLevelName(logging.NOTSET, 'TRACE')
+        logging.basicConfig(level=logging.getLevelName(args.log_level))
+
+    if is_elastic(args):
+        _run_elastic(args)
+    else:
+        _run(args)
 
 
 def run(
@@ -881,8 +936,12 @@ def run(
         args=(),
         kwargs=None,
         np=1,
+        min_np=None,
+        max_np=None,
+        slots=None,
         hosts=None,
         hostfile=None,
+        host_discovery_script=None,
         start_timeout=None,
         ssh_port=None,
         disable_cache=None,
@@ -901,6 +960,15 @@ def run(
     :param args: Arguments to pass to `func`.
     :param kwargs: Keyword arguments to pass to `func`.
     :param np: Number of Horovod processes.
+    :param min_np: Minimum number of processes running for training to continue. If number of
+                   available processes dips below this threshold, then training will wait for
+                   more instances to become available. Defaults to np
+    :param max_np: Maximum number of training processes, beyond which no additional processes
+                   will be created. If not specified, then will be unbounded.
+    :param slots: Number of slots for processes per host. Normally 1 slot per GPU per host.
+                  If slots are provided by the output of the host discovery script, then that
+                  value will override this parameter.
+
     :param hosts: List of host names and the number of available slots
                   for running processes on each, of the form: <hostname>:<slots>
                   (e.g.: host1:2,host2:4,host3:1 indicating 2 processes can run on host1,
@@ -908,6 +976,13 @@ def run(
     :param hostfile: Path to a host file containing the list of host names and the number of
                      available slots. Each line of the file must be of the form:
                      <hostname> slots=<slots>
+    :param host_discovery_script: Used for elastic training (autoscaling and fault tolerance).
+                                  An executable script that will print to stdout every available host
+                                  (one per newline character) that can be used to run worker processes.
+                                  Optionally specifies number of slots on the same line as the hostname
+                                  as: "hostname:slots". Providing a discovery script enables elastic
+                                  training (see min_np, max_np and slots arguments)
+
     :param start_timeout: Horovodrun has to perform all the checks and
                           start the processes before the specified
                           timeout. The default value is 30 seconds.
@@ -951,8 +1026,12 @@ def run(
     hargs = HorovodArgs()
 
     hargs.np = np
+    hargs.min_np = min_np
+    hargs.max_np = max_np
+    hargs.slots = slots
     hargs.hosts = hosts
     hargs.hostfile = hostfile
+    hargs.host_discovery_script = host_discovery_script
     hargs.start_timeout = start_timeout
     hargs.ssh_port = ssh_port
     hargs.mpi_args = mpi_args
@@ -965,7 +1044,10 @@ def run(
 
     hargs.run_func = wrapped_func
 
-    return _run(hargs)
+    if is_elastic(args):
+        _run_elastic(args)
+    else:
+        _run(args)
 
 
 if __name__ == '__main__':

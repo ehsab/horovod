@@ -52,6 +52,13 @@ Controller::Controller(ResponseCache& response_cache, TensorQueue& tensor_queue,
       timeline_(timeline), response_cache_(response_cache),
       parameter_manager_(parameter_manager) {}
 
+void Controller::Initialize() {
+  response_cache_.clear();
+
+  // Initialize concrete implementations.
+  DoInitialization();
+}
+
 ResponseList Controller::ComputeResponseList(std::atomic_bool& shut_down,
                                              HorovodGlobalState& state) {
   // Update cache capacity if autotuning is active.
@@ -154,7 +161,7 @@ ResponseList Controller::ComputeResponseList(std::atomic_bool& shut_down,
   }
 
   if (!message_queue_tmp.empty()) {
-    LOG(DEBUG, rank_) << "Sent " << message_queue_tmp.size()
+    LOG(TRACE, rank_) << "Sent " << message_queue_tmp.size()
                       << " messages to coordinator.";
   }
 
@@ -746,7 +753,7 @@ ResponseList Controller::FuseResponses(std::deque<Response>& responses) {
     }
 
     response_list.add_response(response);
-    LOG(DEBUG) << "Created response of size " << tensor_size;
+    LOG(TRACE) << "Created response of size " << tensor_size;
   }
   return response_list;
 }
